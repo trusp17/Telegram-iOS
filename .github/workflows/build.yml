@@ -1,4 +1,4 @@
-name: CI
+name: Build SwiftGram
 
 on:
   workflow_dispatch:
@@ -6,36 +6,26 @@ on:
 jobs:
   build:
     runs-on: macos-latest
-
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
-          fetch-depth: '0'
+          submodules: recursive
 
       - name: Install jq
         run: brew install jq
 
-      - name: Set Xcode version
+      - name: Set Xcode
         run: |
           XCODE_VERSION=$(jq -r .xcode versions.json)
-          sudo xcode-select -s /Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer
-          echo "Using Xcode $XCODE_VERSION"
+          sudo xcode-select -s /Applications/Xcode_${XCODE_VERSION}.app
 
-      - name: Create working directory
-        run: |
-          sudo mkdir -p /Users/Shared
-          cp -R $GITHUB_WORKSPACE /Users/Shared/
-          mv /Users/Shared/$(basename $GITHUB_WORKSPACE) /Users/Shared/telegram-ios
-
-      - name: Create correct appstore-configuration.json with sg_config
+      - name: Create correct config with sg_config + API keys
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
         run: |
-          cd /Users/Shared/telegram-ios
-
-          cat > build-system/appstore-configuration.json << 'EOF'
+          cd $GITHUB_WORKSPACE
+          cat > build-system/appstore-configuration.json << EOF
 {
   "sg_config": {
     "enablePremium": true,
@@ -46,46 +36,38 @@ jobs:
     "enableLocalPremium": true
   },
   "appConfiguration": {
-    "apiId": ${API_ID},
-    "apiHash": "${API_HASH}",
-    "appVersion": "12.2.1",
+    "apiId": $API_ID,
+    "apiHash": "$API_HASH",
     "bundleId": "org.trusp17.swiftgram",
-    "teamId": ""
+    "appVersion": "12.2.1"
   },
   "buildConfiguration": {
     "configuration": "release_arm64"
   }
 }
 EOF
-          echo "appstore-configuration.json created with sg_config and API keys"
 
-      - name: Generate Xcode project
+      - name: Generate project
         run: |
-          cd /Users/Shared/telegram-ios
-          mkdir -p "$HOME/telegram-bazel-cache"
-          python3 build-system/Make/Make.py \
-            --cacheDir="$HOME/telegram-bazel-cache" \
-            generateProject \
+          cd $GITHUB_WORKSPACE
+          python3 build-system/Make/Make.py generateProject \
             --configurationPath=build-system/appstore-configuration.json \
-            --xcodeManagedCodesigning \
-            --overrideXcodeVersion
+            --xcodeManagedCodesigning
 
       - name: Build IPA
         run: |
-          cd /Users/Shared/telegram-ios
-          python3 -u build-system/Make/Make.py \
-            --cacheDir="$HOME/telegram-bazel-cache" \
-            build \
+          cd $GITHUB_WORKSPACE
+          python3 build-system/Make/Make.py build \
             --configurationPath=build-system/appstore-configuration.json \
-            --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
             --buildNumber=99999
 
-          mkdir -p build/artifacts
-          find . -path "*/applebin_ios-ios_arm64-opt-ST-*/bin/Telegram/Telegram.ipa" -exec cp {} build/artifacts/ \;
+          mkdir -p artifacts
+          cp bazel-out/applebin_ios-ios_arm64-opt-ST-*/bin/Telegram/Telegram.ipa artifacts/ || true
+          cp bazel-out/applebin_ios-ios_arm64-opt-ST-*/bin/Telegram/Telegram.ipa artifacts/SwiftGram.ipa 2>/dev/null || true
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: SwiftGram-IPA-Latest
-          path: /Users/Shared/telegram-ios/build/artifacts/Telegram.ipa
+          name: SwiftGram-Latest-IPA
+          path: artifacts/
