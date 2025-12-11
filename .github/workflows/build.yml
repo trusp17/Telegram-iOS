@@ -1,4 +1,4 @@
-name: Build SwiftGram
+name: SwiftGram Build
 
 on:
   workflow_dispatch:
@@ -17,57 +17,60 @@ jobs:
       - name: Set Xcode
         run: |
           XCODE_VERSION=$(jq -r .xcode versions.json)
-          sudo xcode-select -s /Applications/Xcode_${XCODE_VERSION}.app
+          sudo xcode-select -s /Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer
 
-      - name: Create correct config with sg_config + API keys
+      - name: Create config (твой оригинал + API + sg_config)
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
         run: |
-          cd $GITHUB_WORKSPACE
           cat > build-system/appstore-configuration.json << EOF
 {
-  "sg_config": {
-    "enablePremium": true,
-    "enableGhost": true,
-    "enableAntiDelete": true,
-    "enableForwardWithoutAuthor": true,
-    "enableStoriesWithoutView": true,
-    "enableLocalPremium": true
-  },
-  "appConfiguration": {
-    "apiId": $API_ID,
-    "apiHash": "$API_HASH",
-    "bundleId": "org.trusp17.swiftgram",
-    "appVersion": "12.2.1"
-  },
-  "buildConfiguration": {
-    "configuration": "release_arm64"
-  }
+  "sg_config": {},
+  "bundle_id": "org.trusp17.swiftgram",
+  "api_id": "${API_ID}",
+  "api_hash": "${API_HASH}",
+  "team_id": "",
+  "app_center_id": "0",
+  "is_internal_build": "true",
+  "is_appstore_build": "false",
+  "appstore_id": "686449807",
+  "app_specific_url_scheme": "sg",
+  "premium_iap_product_id": "org.telegram.telegramPremium.monthly",
+  "enable_siri": true,
+  "enable_icloud": true
 }
 EOF
 
       - name: Generate project
         run: |
-          cd $GITHUB_WORKSPACE
-          python3 build-system/Make/Make.py generateProject \
+          mkdir -p ~/telegram-bazel-cache
+          python3 build-system/Make/Make.py \
+            --cacheDir="$HOME/telegram-bazel-cache" \
+            generateProject \
             --configurationPath=build-system/appstore-configuration.json \
-            --xcodeManagedCodesigning
+            --xcodeManagedCodesigning \
+            --overrideXcodeVersion
 
       - name: Build IPA
         run: |
-          cd $GITHUB_WORKSPACE
-          python3 build-system/Make/Make.py build \
+          python3 -u build-system/Make/Make.py \
+            --cacheDir="$HOME/telegram-bazel-cache" \
+            build \
             --configurationPath=build-system/appstore-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
             --buildNumber=99999
 
           mkdir -p artifacts
-          cp bazel-out/applebin_ios-ios_arm64-opt-ST-*/bin/Telegram/Telegram.ipa artifacts/ || true
-          cp bazel-out/applebin_ios-ios_arm64-opt-ST-*/bin/Telegram/Telegram.ipa artifacts/SwiftGram.ipa 2>/dev/null || true
+          for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
+            cp "$f" artifacts/SwiftGram.ipa || true
+          done
+          ls -la artifacts/
 
-      - name: Upload IPA
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: SwiftGram-Latest-IPA
-          path: artifacts/
+          name: SwiftGram-IPA
+          path: artifacts/SwiftGram.ipa
+          retention-days: 7
