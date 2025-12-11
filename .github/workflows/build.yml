@@ -5,7 +5,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-13 # Telegram обычно требует конкретную версию macOS/Xcode
+    runs-on: macos-13
 
     steps:
       - uses: actions/checkout@v4
@@ -15,28 +15,26 @@ jobs:
 
       - name: Set active Xcode path
         run: |
-          # Используем версию из json или фиксируем 15.0/15.1 если нужно
           XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
           echo "Selected Xcode: $XCODE_VERSION"
           sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
 
-      - name: Move to Short Path (Canonical Dir)
-        run: |
-          set -x
-          sudo mkdir -p /Users/Shared
-          # Копируем текущий воркспейс в короткий путь
-          cp -R $GITHUB_WORKSPACE /Users/Shared/
-          # Переименовываем для стабильности
-          mv /Users/Shared/$(basename $GITHUB_WORKSPACE) /Users/Shared/telegram-ios
-
-      - name: Create Config (Inject Secrets)
+      - name: Prepare Source & Config
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
         run: |
-          # ВАЖНО: Создаем конфиг уже в НОВОЙ папке /Users/Shared/telegram-ios
+          set -x
+          # 1. Создаем папку в /Users/Shared (как в оригинале)
+          sudo mkdir -p /Users/Shared
+          cp -R $GITHUB_WORKSPACE /Users/Shared/
+          mv /Users/Shared/$(basename $GITHUB_WORKSPACE) /Users/Shared/telegram-ios
+          
+          # 2. Переходим в эту папку
           cd /Users/Shared/telegram-ios
           
+          # 3. Создаем конфиг ПРЯМО ТУТ (Важный момент!)
+          # Мы пишем его сразу в build-system внутри новой папки
           cat > build-system/appstore-configuration.json << EOF
           {
             "sg_config": {},
@@ -55,7 +53,10 @@ jobs:
           }
           EOF
           
-          # Проверка (для логов), что файл на месте
+          # 4. Проверяем, что файл создался (для отладки)
+          echo "Checking config existence:"
+          ls -l build-system/appstore-configuration.json
+          echo "Config content preview:"
           cat build-system/appstore-configuration.json
 
       - name: Build the App
@@ -67,17 +68,18 @@ jobs:
 
           cd $SOURCE_DIR
 
-          # Вычисляем версию и номер сборки
+          # Вычисляем версию
           BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
           export APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
           export COMMIT_COUNT=$(git rev-list --count HEAD)
           export COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
           export BUILD_NUMBER="$COMMIT_COUNT"
 
-          # Импорт сертификатов (фейковых для CI, если у тебя нет настоящих)
+          # Импорт сертификатов
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
 
           # ЗАПУСК СБОРКИ
+          # Обрати внимание: путь к конфигу теперь относительный, так как мы внутри папки
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             build \
@@ -91,7 +93,7 @@ jobs:
           rm -rf "$OUTPUT_PATH"
           mkdir -p "$OUTPUT_PATH"
           
-          # Ищем IPA и копируем
+          # Копируем IPA
           find bazel-out -name "Telegram.ipa" -exec cp {} $OUTPUT_PATH/SwiftGram.ipa \;
 
       - name: Upload Artifact
