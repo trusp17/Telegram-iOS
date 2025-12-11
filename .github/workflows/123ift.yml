@@ -1,0 +1,195 @@
+name: SwiftGram FINAL v13
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: '0'
+
+      - name: Set Xcode
+        run: |
+          XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
+          echo "Desired Xcode: $XCODE_VERSION"
+          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer || echo "Xcode not found, using default..."
+
+      - name: RUN BUILD (TOTAL RE-SIGN + CERT INJECTION)
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+        run: |
+          set -e
+          set -x
+
+          echo ">>> 1. MOVING SOURCE TO /Users/Shared <<<"
+          sudo mkdir -p /Users/Shared
+          cp -R $GITHUB_WORKSPACE /Users/Shared/telegram-ios
+          cd /Users/Shared/telegram-ios
+
+          echo ">>> 2. CREATING CONFIG (ORIGINAL BUNDLE ID) <<<"
+          cat > build-system/appstore-configuration.json << EOF
+          {
+            "sg_config": {},
+            "bundle_id": "ph.telegra.Telegraph",
+            "api_id": "${API_ID}",
+            "api_hash": "${API_HASH}",
+            "team_id": "C67CF9S4VU",
+            "app_center_id": "0",
+            "is_internal_build": "true",
+            "is_appstore_build": "false",
+            "appstore_id": "686449807",
+            "app_specific_url_scheme": "sg",
+            "premium_iap_product_id": "org.telegram.telegramPremium.monthly",
+            "enable_siri": true,
+            "enable_icloud": true
+          }
+          EOF
+          grep "sg_config" build-system/appstore-configuration.json || { echo "CRITICAL: sg_config MISSING!"; exit 1; }
+
+          echo ">>> 3. GENERATING NEW FRESH CERTIFICATES <<<"
+          mkdir -p build-system/fake-codesigning/certs
+          cd build-system/fake-codesigning/certs
+          rm -f *
+          
+          # Генерируем ключи
+          openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+            -keyout ios_development.key \
+            -out ios_development.pem \
+            -subj "/CN=iPhone Developer: Fake Signer (C67CF9S4VU)/C=US"
+            
+          openssl pkcs12 -export -out ios_development.p12 -inkey ios_development.key -in ios_development.pem -passout pass:12345
+          
+          # Получаем BASE64 нашего сертификата (без заголовков) для вставки в профиль
+          # Это нужно, чтобы профиль "доверял" нашему ключу
+          CERT_BASE64=$(openssl x509 -in ios_development.pem -outform DER | base64)
+          # Убираем переносы строк для вставки в XML
+          CERT_BASE64_CLEAN=$(echo "$CERT_BASE64" | tr -d '\n')
+          
+          CERT_PATH="$(pwd)/ios_development.pem"
+          KEY_PATH="$(pwd)/ios_development.key"
+          P12_PATH="$(pwd)/ios_development.p12"
+          
+          echo "Cert generated. Base64 length: ${#CERT_BASE64_CLEAN}"
+          cd ../../..
+
+          echo ">>> 4. HACKING PROFILES (DEEP XML INJECTION) <<<"
+          cd build-system/fake-codesigning
+          
+          SOURCE_PROFILE=$(find . -name "*.mobileprovision" | head -n 1)
+          if [ -z "$SOURCE_PROFILE" ]; then
+             touch dummy.mobileprovision
+             SOURCE_PROFILE="dummy.mobileprovision"
+          fi
+          
+          REQUIRED=("Telegram.mobileprovision" "BroadcastUpload.mobileprovision" "Share.mobileprovision" "Widget.mobileprovision" "NotificationService.mobileprovision" "Intents.mobileprovision" "WatchApp.mobileprovision" "WatchExtension.mobileprovision")
+          DIRS=("." "profiles" "provisioning")
+          
+          for DIR in "${DIRS[@]}"; do
+             mkdir -p "$DIR"
+             
+             for FILE in "${REQUIRED[@]}"; do
+               TARGET_PATH="$DIR/$FILE"
+               if [ ! -f "$TARGET_PATH" ]; then
+                 cp "$SOURCE_PROFILE" "$TARGET_PATH"
+               fi
+               
+               # 1. Снимаем подпись (получаем plist)
+               security cms -D -i "$TARGET_PATH" -o temp.plist || cp "$TARGET_PATH" temp.plist
+               
+               # 2. МЕНЯЕМ ДАТУ (на 2035)
+               perl -i -pe 's/2025/2035/g' temp.plist
+               
+               # 3. ВНЕДРЯЕМ НАШ СЕРТИФИКАТ В XML
+               # Мы используем Python для точной замены массива DeveloperCertificates
+               # Это заставит Xcode принять наш самопальный ключ
+               python3 -c "
+import plistlib
+import base64
+import sys
+
+try:
+    with open('temp.plist', 'rb') as f:
+        pl = plistlib.load(f)
+    
+    # Наш сертификат из переменной окружения
+    new_cert_data = base64.b64decode('$CERT_BASE64_CLEAN')
+    
+    # Заменяем все сертификаты в профиле на НАШ
+    pl['DeveloperCertificates'] = [new_cert_data]
+    
+    # На всякий случай обновляем TeamID, если он отличается
+    pl['TeamIdentifier'] = ['C67CF9S4VU']
+    pl['TeamName'] = 'Fake Team'
+    
+    with open('temp.plist', 'wb') as f:
+        plistlib.dump(pl, f)
+    print(f'Successfully injected certificate into {sys.argv[1]}')
+except Exception as e:
+    print(f'Error patching plist: {e}')
+" "$TARGET_PATH"
+
+               # 4. ПОДПИСЫВАЕМ ЗАНОВО
+               openssl smime -sign -in temp.plist -out "$TARGET_PATH" \
+                 -signer "$CERT_PATH" -inkey "$KEY_PATH" \
+                 -outform der -nodetach
+                 
+               rm -f temp.plist
+             done
+             
+             rm -f "$DIR/BUILD"
+             cat > "$DIR/BUILD" << EOF
+          package(default_visibility = ["//visibility:public"])
+          exports_files(glob(["*.mobileprovision"]))
+          EOF
+          done
+          cd ../..
+
+          echo ">>> 5. MANUAL KEYCHAIN IMPORT <<<"
+          KEYCHAIN_PATH=$HOME/Library/Keychains/ios-build.keychain
+          KEYCHAIN_PASSWORD=ios-build
+          
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          
+          security import "$P12_PATH" -k "$KEYCHAIN_PATH" -P 12345 -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          
+          # Проверка, видит ли система наш ключ
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+          echo ">>> 6. BUILDING IPA <<<"
+          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
+          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
+          APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
+          BUILD_NUMBER="$COMMIT_COUNT"
+          
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --overrideXcodeVersion \
+            build \
+            --configurationPath="build-system/appstore-configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER"
+
+          echo ">>> 7. COLLECTING ARTIFACTS <<<"
+          OUTPUT_PATH="build/artifacts"
+          mkdir -p "$OUTPUT_PATH"
+          find bazel-out -name "Telegram.ipa" -exec cp {} $OUTPUT_PATH/SwiftGram.ipa \;
+
+      - name: Upload Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwiftGram-IPA
+          path: /Users/Shared/telegram-ios/build/artifacts/SwiftGram.ipa
+          retention-days: 7
