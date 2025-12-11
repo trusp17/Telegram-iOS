@@ -1,11 +1,11 @@
-name: SwiftGram RELEASE v2
+name: SwiftGram RELEASE Final
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest # Самая новая мак ось
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -15,7 +15,6 @@ jobs:
 
       - name: Set Xcode
         run: |
-          # Пытаемся выбрать Xcode, но если нет - не падаем
           XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
           echo "Desired Xcode: $XCODE_VERSION"
           sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer || echo "Xcode not found, using default..."
@@ -34,7 +33,6 @@ jobs:
           cd /Users/Shared/telegram-ios
 
           echo ">>> 2. CREATING CONFIG <<<"
-          # Создаем конфиг с нуля
           cat > build-system/appstore-configuration.json << EOF
           {
             "sg_config": {},
@@ -68,14 +66,15 @@ jobs:
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
 
           echo ">>> 6. BUILDING IPA <<<"
+          # ИСПРАВЛЕНО: --overrideXcodeVersion стоит ПЕРЕД build
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --overrideXcodeVersion \
             build \
             --configurationPath="build-system/appstore-configuration.json" \
             --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
-            --buildNumber="$BUILD_NUMBER" \
-            --overrideXcodeVersion
+            --buildNumber="$BUILD_NUMBER"
 
           echo ">>> 7. COLLECTING ARTIFACTS <<<"
           OUTPUT_PATH="build/artifacts"
