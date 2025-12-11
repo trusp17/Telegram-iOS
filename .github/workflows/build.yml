@@ -1,45 +1,39 @@
-name: SwiftGram Build Final
+name: SwiftGram Ultimate Build
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-13 # Используем стабильную версию для Telegram
-    
+    runs-on: macos-13
+
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: 'recursive'
-          fetch-depth: '0' # Нужно для правильного номера сборки
+          fetch-depth: '0'
 
-      - name: Set Xcode Version
+      - name: Set Xcode
         run: |
-          # Скрипт сам найдет нужную версию Xcode из файла versions.json
           XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
-          echo "Setting Xcode to $XCODE_VERSION"
           sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
 
-      - name: Move to Short Path & Create Config
+      - name: RUN ALL IN ONE (Move, Config, Build)
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
         run: |
-          set -x
-          
-          # 1. Создаем рабочую папку в коротком пути (чтобы избежать ошибок Bazel)
-          echo "Moving source to /Users/Shared/telegram-ios..."
+          set -e # Падать при любой ошибке
+          set -x # Показывать команды
+
+          echo ">>> 1. MOVING SOURCE TO /Users/Shared <<<"
           sudo mkdir -p /Users/Shared
-          # Копируем всё содержимое текущей папки в Shared
           cp -R $GITHUB_WORKSPACE /Users/Shared/telegram-ios
-          
-          # 2. Переходим в эту папку. ВСЯ дальнейшая работа только тут.
           cd /Users/Shared/telegram-ios
+
+          echo ">>> 2. CREATING CONFIG (OVERWRITE) <<<"
+          # Мы ВНУТРИ папки /Users/Shared/telegram-ios. Пишем конфиг ПРЯМО СЮДА.
           
-          # 3. Создаем конфигурацию.
-          # ВАЖНО: Добавлен блок "sg_config": {}, которого нет в обычном Telegram, но он нужен для Swiftgram.
-          echo "Creating configuration file..."
           cat > build-system/appstore-configuration.json << EOF
           {
             "sg_config": {},
@@ -57,34 +51,29 @@ jobs:
             "enable_icloud": true
           }
           EOF
-          
-          # Проверка для логов (чтобы ты видел, что файл создался правильно)
-          echo "=== CONFIG PREVIEW ==="
-          cat build-system/appstore-configuration.json
-          echo "=== END PREVIEW ==="
 
-      - name: Build IPA
-        run: |
-          set -x
-          # Работаем строго в папке /Users/Shared/telegram-ios
-          cd /Users/Shared/telegram-ios
+          echo ">>> 3. VERIFYING CONFIG <<<"
+          # Читаем файл. Если тут нет sg_config, значит магия существует.
+          cat build-system/appstore-configuration.json
           
+          # Проверяем наличие строки sg_config грепом, чтобы упасть сразу, если её нет
+          grep "sg_config" build-system/appstore-configuration.json || { echo "CRITICAL: sg_config MISSING!"; exit 1; }
+
+          echo ">>> 4. PREPARING ENV <<<"
           BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
-          
-          # Вычисляем версию и номер билда (как в оригинальном скрипте)
           BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
           APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
           COMMIT_COUNT=$(git rev-list --count HEAD)
           COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
           BUILD_NUMBER="$COMMIT_COUNT"
           
-          echo "Building Version: $APP_VERSION ($BUILD_NUMBER)"
+          echo "Build Number: $BUILD_NUMBER"
 
-          # Подготовка сертификатов (используем фейковые для GitHub Actions)
+          echo ">>> 5. IMPORTING CERTS <<<"
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
 
-          # ЗАПУСК СБОРКИ
-          # --overrideXcodeVersion добавлен на случай, если версия Xcode на сервере чуть отличается
+          echo ">>> 6. BUILDING IPA <<<"
+          # ВАЖНО: Мы уже в нужной папке, путь к конфигу локальный
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             build \
@@ -94,22 +83,16 @@ jobs:
             --buildNumber="$BUILD_NUMBER" \
             --overrideXcodeVersion
 
-      - name: Collect & Upload Artifacts
-        if: always() # Запускать даже если сборка упала (чтобы увидеть логи, если что)
-        run: |
-          set -x
-          OUTPUT_DIR="artifacts"
-          mkdir -p $OUTPUT_DIR
-          
-          # Ищем собранный IPA в недрах bazel-out
-          # Мы используем find, потому что путь может немного меняться
-          find /Users/Shared/telegram-ios/bazel-out -name "Telegram.ipa" -exec cp {} $OUTPUT_DIR/SwiftGram.ipa \;
-          
+          echo ">>> 7. COLLECTING ARTIFACTS <<<"
+          OUTPUT_PATH="build/artifacts"
+          mkdir -p "$OUTPUT_PATH"
+          find bazel-out -name "Telegram.ipa" -exec cp {} $OUTPUT_PATH/SwiftGram.ipa \;
           ls -la $OUTPUT_DIR
 
-      - name: Upload to GitHub
+      - name: Upload Artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: SwiftGram-IPA
-          path: artifacts/SwiftGram.ipa
-          retention-days: 3
+          path: /Users/Shared/telegram-ios/build/artifacts/SwiftGram.ipa
+          retention-days: 7
