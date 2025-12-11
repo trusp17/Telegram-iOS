@@ -1,4 +1,4 @@
-name: SwiftGram FINAL v13
+name: SwiftGram FINAL v14
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ jobs:
           echo "Desired Xcode: $XCODE_VERSION"
           sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer || echo "Xcode not found, using default..."
 
-      - name: RUN BUILD (TOTAL RE-SIGN + CERT INJECTION)
+      - name: RUN BUILD (INJECTED CERTIFICATES)
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
@@ -27,12 +27,14 @@ jobs:
           set -e
           set -x
 
-          echo ">>> 1. MOVING SOURCE TO /Users/Shared <<<"
+          # 1. ПОДГОТОВКА ПАПОК
+          echo ">>> 1. MOVING SOURCE <<<"
           sudo mkdir -p /Users/Shared
           cp -R $GITHUB_WORKSPACE /Users/Shared/telegram-ios
           cd /Users/Shared/telegram-ios
 
-          echo ">>> 2. CREATING CONFIG (ORIGINAL BUNDLE ID) <<<"
+          # 2. СОЗДАЕМ КОНФИГ
+          echo ">>> 2. CREATING CONFIG <<<"
           cat > build-system/appstore-configuration.json << EOF
           {
             "sg_config": {},
@@ -52,7 +54,8 @@ jobs:
           EOF
           grep "sg_config" build-system/appstore-configuration.json || { echo "CRITICAL: sg_config MISSING!"; exit 1; }
 
-          echo ">>> 3. GENERATING NEW FRESH CERTIFICATES <<<"
+          # 3. ГЕНЕРИРУЕМ СЕРТИФИКАТЫ
+          echo ">>> 3. GENERATING CERTIFICATES <<<"
           mkdir -p build-system/fake-codesigning/certs
           cd build-system/fake-codesigning/certs
           rm -f *
@@ -65,20 +68,63 @@ jobs:
             
           openssl pkcs12 -export -out ios_development.p12 -inkey ios_development.key -in ios_development.pem -passout pass:12345
           
-          # Получаем BASE64 нашего сертификата (без заголовков) для вставки в профиль
-          # Это нужно, чтобы профиль "доверял" нашему ключу
+          # Получаем чистый BASE64 сертификата (для вставки в XML)
           CERT_BASE64=$(openssl x509 -in ios_development.pem -outform DER | base64)
-          # Убираем переносы строк для вставки в XML
           CERT_BASE64_CLEAN=$(echo "$CERT_BASE64" | tr -d '\n')
           
+          # Сохраняем пути
           CERT_PATH="$(pwd)/ios_development.pem"
           KEY_PATH="$(pwd)/ios_development.key"
           P12_PATH="$(pwd)/ios_development.p12"
           
-          echo "Cert generated. Base64 length: ${#CERT_BASE64_CLEAN}"
           cd ../../..
 
-          echo ">>> 4. HACKING PROFILES (DEEP XML INJECTION) <<<"
+          # 4. СОЗДАЕМ СКРИПТ-ПАТЧЕР (PYTHON)
+          # Мы записываем его в файл, чтобы не было ошибок синтаксиса в YAML
+          echo ">>> 4. PREPARING PYTHON PATCHER <<<"
+          cat << EOF > patcher.py
+          import plistlib
+          import base64
+          import sys
+          import os
+
+          file_path = sys.argv[1]
+          cert_b64 = sys.argv[2]
+
+          try:
+              print(f"Patching {file_path}...")
+              with open(file_path, 'rb') as f:
+                  pl = plistlib.load(f)
+              
+              # Создаем объект data из нашего base64
+              new_cert_data = base64.b64decode(cert_b64)
+              
+              # ЗАМЕНЯЕМ сертификаты в профиле на НАШ
+              pl['DeveloperCertificates'] = [new_cert_data]
+              
+              # Обновляем TeamID чтобы совпадал с сертификатом
+              pl['TeamIdentifier'] = ['C67CF9S4VU']
+              pl['TeamName'] = 'Fake Team'
+              
+              # Продлеваем жизнь до 2035 года
+              if 'ExpirationDate' in pl:
+                  # Это грубый хак, но plistlib сохранит дату как есть, если мы её не трогаем объектом
+                  # Но нам нужно поменять год. Проще сделать это sed-ом ПОСЛЕ дампа, 
+                  # либо надеяться, что профиль валиден.
+                  # Оставим дату как есть, но perl-ом потом пройдемся для надежности.
+                  pass
+
+              with open(file_path, 'wb') as f:
+                  plistlib.dump(pl, f)
+              
+              print("Success!")
+          except Exception as e:
+              print(f"Error: {e}")
+              sys.exit(1)
+          EOF
+
+          # 5. ХАКАЕМ ПРОФИЛИ
+          echo ">>> 5. HACKING PROFILES <<<"
           cd build-system/fake-codesigning
           
           SOURCE_PROFILE=$(find . -name "*.mobileprovision" | head -n 1)
@@ -99,42 +145,17 @@ jobs:
                  cp "$SOURCE_PROFILE" "$TARGET_PATH"
                fi
                
-               # 1. Снимаем подпись (получаем plist)
+               # A. Снимаем подпись (получаем plist)
                security cms -D -i "$TARGET_PATH" -o temp.plist || cp "$TARGET_PATH" temp.plist
                
-               # 2. МЕНЯЕМ ДАТУ (на 2035)
+               # B. Меняем дату (Perl справляется с XML текстом лучше)
                perl -i -pe 's/2025/2035/g' temp.plist
                
-               # 3. ВНЕДРЯЕМ НАШ СЕРТИФИКАТ В XML
-               # Мы используем Python для точной замены массива DeveloperCertificates
-               # Это заставит Xcode принять наш самопальный ключ
-               python3 -c "
-import plistlib
-import base64
-import sys
-
-try:
-    with open('temp.plist', 'rb') as f:
-        pl = plistlib.load(f)
-    
-    # Наш сертификат из переменной окружения
-    new_cert_data = base64.b64decode('$CERT_BASE64_CLEAN')
-    
-    # Заменяем все сертификаты в профиле на НАШ
-    pl['DeveloperCertificates'] = [new_cert_data]
-    
-    # На всякий случай обновляем TeamID, если он отличается
-    pl['TeamIdentifier'] = ['C67CF9S4VU']
-    pl['TeamName'] = 'Fake Team'
-    
-    with open('temp.plist', 'wb') as f:
-        plistlib.dump(pl, f)
-    print(f'Successfully injected certificate into {sys.argv[1]}')
-except Exception as e:
-    print(f'Error patching plist: {e}')
-" "$TARGET_PATH"
-
-               # 4. ПОДПИСЫВАЕМ ЗАНОВО
+               # C. Внедряем сертификат через наш Python скрипт
+               # Вызываем скрипт из корня
+               python3 ../../patcher.py temp.plist "$CERT_BASE64_CLEAN"
+               
+               # D. Подписываем заново
                openssl smime -sign -in temp.plist -out "$TARGET_PATH" \
                  -signer "$CERT_PATH" -inkey "$KEY_PATH" \
                  -outform der -nodetach
@@ -150,7 +171,8 @@ except Exception as e:
           done
           cd ../..
 
-          echo ">>> 5. MANUAL KEYCHAIN IMPORT <<<"
+          # 6. ИМПОРТ В KEYCHAIN
+          echo ">>> 6. KEYCHAIN SETUP <<<"
           KEYCHAIN_PATH=$HOME/Library/Keychains/ios-build.keychain
           KEYCHAIN_PASSWORD=ios-build
           
@@ -161,10 +183,11 @@ except Exception as e:
           security import "$P12_PATH" -k "$KEYCHAIN_PATH" -P 12345 -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           
-          # Проверка, видит ли система наш ключ
+          # Проверка
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
 
-          echo ">>> 6. BUILDING IPA <<<"
+          # 7. СБОРКА
+          echo ">>> 7. STARTING BUILD <<<"
           BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
           BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
           APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
@@ -181,7 +204,8 @@ except Exception as e:
             --configuration=release_arm64 \
             --buildNumber="$BUILD_NUMBER"
 
-          echo ">>> 7. COLLECTING ARTIFACTS <<<"
+          # 8. СБОР АРТЕФАКТОВ
+          echo ">>> 8. COLLECTING ARTIFACTS <<<"
           OUTPUT_PATH="build/artifacts"
           mkdir -p "$OUTPUT_PATH"
           find bazel-out -name "Telegram.ipa" -exec cp {} $OUTPUT_PATH/SwiftGram.ipa \;
