@@ -1,0 +1,147 @@
+name: SwiftGram FINAL v10
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: '0'
+
+      - name: Set Xcode
+        run: |
+          XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
+          echo "Desired Xcode: $XCODE_VERSION"
+          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer || echo "Xcode not found, using default..."
+
+      - name: RUN BUILD
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+        run: |
+          set -e
+          set -x
+
+          echo ">>> 1. MOVING SOURCE TO /Users/Shared <<<"
+          sudo mkdir -p /Users/Shared
+          cp -R $GITHUB_WORKSPACE /Users/Shared/telegram-ios
+          cd /Users/Shared/telegram-ios
+
+          echo ">>> 2. CREATING CONFIG (ORIGINAL BUNDLE ID) <<<"
+          cat > build-system/appstore-configuration.json << EOF
+          {
+            "sg_config": {},
+            "bundle_id": "ph.telegra.Telegraph",
+            "api_id": "${API_ID}",
+            "api_hash": "${API_HASH}",
+            "team_id": "C67CF9S4VU",
+            "app_center_id": "0",
+            "is_internal_build": "true",
+            "is_appstore_build": "false",
+            "appstore_id": "686449807",
+            "app_specific_url_scheme": "sg",
+            "premium_iap_product_id": "org.telegram.telegramPremium.monthly",
+            "enable_siri": true,
+            "enable_icloud": true
+          }
+          EOF
+
+          echo ">>> 3. VERIFYING CONFIG <<<"
+          grep "sg_config" build-system/appstore-configuration.json || { echo "CRITICAL: sg_config MISSING!"; exit 1; }
+
+          echo ">>> 4. FIXING FAKE CODESIGNING (EXTRACT -> PATCH -> RESIGN) <<<"
+          cd build-system/fake-codesigning
+          
+          # А. Генерируем свой временный сертификат для подписи
+          echo "Generating temp signing identity..."
+          openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout temp.key -out temp.crt -subj "/CN=FakeSigner"
+          
+          # Б. Находим шаблон
+          SOURCE_PROFILE=$(find . -name "*.mobileprovision" | head -n 1)
+          if [ -z "$SOURCE_PROFILE" ]; then
+             echo "Creating dummy profile..."
+             # Если совсем ничего нет, создаем пустышку (хотя это вряд ли сработает, но лучше чем краш)
+             touch dummy.mobileprovision
+             SOURCE_PROFILE="dummy.mobileprovision"
+          fi
+          
+          REQUIRED=("Telegram.mobileprovision" "BroadcastUpload.mobileprovision" "Share.mobileprovision" "Widget.mobileprovision" "NotificationService.mobileprovision" "Intents.mobileprovision" "WatchApp.mobileprovision" "WatchExtension.mobileprovision")
+          DIRS=("." "profiles" "provisioning")
+          
+          for DIR in "${DIRS[@]}"; do
+             mkdir -p "$DIR"
+             echo "--- Patching directory: $DIR ---"
+             
+             for FILE in "${REQUIRED[@]}"; do
+               TARGET_PATH="$DIR/$FILE"
+               
+               # 1. Если файла нет, копируем исходный (пока еще с валидной подписью)
+               if [ ! -f "$TARGET_PATH" ]; then
+                 cp "$SOURCE_PROFILE" "$TARGET_PATH"
+               fi
+               
+               echo "Processing $TARGET_PATH..."
+               
+               # 2. ВЫТАСКИВАЕМ XML (убираем старую подпись)
+               # Используем openssl для извлечения контента
+               openssl smime -inform der -verify -noverify -in "$TARGET_PATH" -out "temp.plist" 2>/dev/null || cp "$TARGET_PATH" "temp.plist"
+               
+               # 3. МЕНЯЕМ ДАТУ в XML
+               perl -i -pe 's/2025/2035/g' "temp.plist"
+               
+               # 4. ПОДПИСЫВАЕМ ЗАНОВО своим ключом
+               openssl smime -sign -in "temp.plist" -out "$TARGET_PATH" -signer temp.crt -inkey temp.key -outform der -nodetach
+               
+             done
+             
+             # Создаем BUILD файл
+             rm -f "$DIR/BUILD"
+             cat > "$DIR/BUILD" << EOF
+          package(default_visibility = ["//visibility:public"])
+          exports_files(glob(["*.mobileprovision"]))
+          EOF
+          done
+          
+          # Убираем мусор
+          rm -f temp.key temp.crt temp.plist
+          
+          cd ../..
+
+          echo ">>> 5. PREPARING ENV <<<"
+          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
+          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
+          APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
+          BUILD_NUMBER="$COMMIT_COUNT"
+
+          echo ">>> 6. IMPORTING CERTS <<<"
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+
+          echo ">>> 7. BUILDING IPA <<<"
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --overrideXcodeVersion \
+            build \
+            --configurationPath="build-system/appstore-configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER"
+
+          echo ">>> 8. COLLECTING ARTIFACTS <<<"
+          OUTPUT_PATH="build/artifacts"
+          mkdir -p "$OUTPUT_PATH"
+          find bazel-out -name "Telegram.ipa" -exec cp {} $OUTPUT_PATH/SwiftGram.ipa \;
+
+      - name: Upload Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwiftGram-IPA
+          path: /Users/Shared/telegram-ios/build/artifacts/SwiftGram.ipa
+          retention-days: 7
