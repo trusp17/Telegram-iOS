@@ -23,7 +23,7 @@ jobs:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
         run: |
-          set -e # Падать при любой ошибке
+          set -e # Падать при ошибке
           set -x # Показывать команды
 
           echo ">>> 1. MOVING SOURCE TO /Users/Shared <<<"
@@ -32,8 +32,7 @@ jobs:
           cd /Users/Shared/telegram-ios
 
           echo ">>> 2. CREATING CONFIG (OVERWRITE) <<<"
-          # Мы ВНУТРИ папки /Users/Shared/telegram-ios. Пишем конфиг ПРЯМО СЮДА.
-          
+          # Создаем конфиг ПРЯМО ТУТ, чтобы он 100% был на месте
           cat > build-system/appstore-configuration.json << EOF
           {
             "sg_config": {},
@@ -53,10 +52,7 @@ jobs:
           EOF
 
           echo ">>> 3. VERIFYING CONFIG <<<"
-          # Читаем файл. Если тут нет sg_config, значит магия существует.
-          cat build-system/appstore-configuration.json
-          
-          # Проверяем наличие строки sg_config грепом, чтобы упасть сразу, если её нет
+          # Проверяем, что файл записался
           grep "sg_config" build-system/appstore-configuration.json || { echo "CRITICAL: sg_config MISSING!"; exit 1; }
 
           echo ">>> 4. PREPARING ENV <<<"
@@ -73,7 +69,7 @@ jobs:
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
 
           echo ">>> 6. BUILDING IPA <<<"
-          # ВАЖНО: Мы уже в нужной папке, путь к конфигу локальный
+          # Запускаем сборку с нашим конфигом
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             build \
@@ -87,7 +83,6 @@ jobs:
           OUTPUT_PATH="build/artifacts"
           mkdir -p "$OUTPUT_PATH"
           find bazel-out -name "Telegram.ipa" -exec cp {} $OUTPUT_PATH/SwiftGram.ipa \;
-          ls -la $OUTPUT_DIR
 
       - name: Upload Artifact
         if: always()
