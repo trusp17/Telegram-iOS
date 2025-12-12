@@ -1,0 +1,202 @@
+name: SwiftGram FINAL v15
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: '0'
+
+      - name: Set Xcode
+        run: |
+          XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
+          echo "Desired Xcode: $XCODE_VERSION"
+          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer || echo "Xcode not found, using default..."
+
+      - name: RUN BUILD (PYTHON PROFILE FIXER)
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+        run: |
+          set -e
+          set -x
+
+          # 1. INIT
+          echo ">>> 1. SETUP <<<"
+          sudo mkdir -p /Users/Shared
+          cp -R $GITHUB_WORKSPACE /Users/Shared/telegram-ios
+          cd /Users/Shared/telegram-ios
+
+          # 2. CONFIG
+          echo ">>> 2. CONFIG <<<"
+          cat > build-system/appstore-configuration.json << EOF
+          {
+            "sg_config": {},
+            "bundle_id": "ph.telegra.Telegraph",
+            "api_id": "${API_ID}",
+            "api_hash": "${API_HASH}",
+            "team_id": "C67CF9S4VU",
+            "app_center_id": "0",
+            "is_internal_build": "true",
+            "is_appstore_build": "false",
+            "appstore_id": "686449807",
+            "app_specific_url_scheme": "sg",
+            "premium_iap_product_id": "org.telegram.telegramPremium.monthly",
+            "enable_siri": true,
+            "enable_icloud": true
+          }
+          EOF
+          grep "sg_config" build-system/appstore-configuration.json || { echo "CRITICAL: sg_config MISSING!"; exit 1; }
+
+          # 3. CERTS
+          echo ">>> 3. CERTS <<<"
+          mkdir -p build-system/fake-codesigning/certs
+          cd build-system/fake-codesigning/certs
+          rm -f *
+          
+          openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+            -keyout ios_development.key \
+            -out ios_development.pem \
+            -subj "/CN=iPhone Developer: Fake Signer (C67CF9S4VU)/C=US"
+            
+          openssl pkcs12 -export -out ios_development.p12 -inkey ios_development.key -in ios_development.pem -passout pass:12345
+          
+          CERT_BASE64=$(openssl x509 -in ios_development.pem -outform DER | base64)
+          CERT_BASE64_CLEAN=$(echo "$CERT_BASE64" | tr -d '\n')
+          
+          CERT_PATH="$(pwd)/ios_development.pem"
+          KEY_PATH="$(pwd)/ios_development.key"
+          P12_PATH="$(pwd)/ios_development.p12"
+          
+          cd ../../..
+
+          # 4. PYTHON PATCHER (DATE + CERT FIX)
+          echo ">>> 4. PREPARING PATCHER <<<"
+          cat << EOF > patcher.py
+          import plistlib
+          import base64
+          import sys
+          import datetime
+
+          file_path = sys.argv[1]
+          cert_b64 = sys.argv[2]
+
+          try:
+              print(f"Patching {file_path}...")
+              with open(file_path, 'rb') as f:
+                  pl = plistlib.load(f)
+              
+              # 1. Меняем сертификат
+              new_cert_data = base64.b64decode(cert_b64)
+              pl['DeveloperCertificates'] = [new_cert_data]
+              
+              # 2. Меняем TeamID
+              pl['TeamIdentifier'] = ['C67CF9S4VU']
+              pl['TeamName'] = 'Fake Team'
+              
+              # 3. МЕНЯЕМ ДАТУ (Продлеваем на 10 лет)
+              # Создаем новую дату: сейчас + 3650 дней
+              future_date = datetime.datetime.now() + datetime.timedelta(days=3650)
+              pl['ExpirationDate'] = future_date
+              
+              # Также обновляем CreationDate
+              pl['CreationDate'] = datetime.datetime.now()
+
+              with open(file_path, 'wb') as f:
+                  plistlib.dump(pl, f)
+              
+              print(f"Success! New expiration: {future_date}")
+          except Exception as e:
+              print(f"Error patching plist: {e}")
+              sys.exit(1)
+          EOF
+
+          # 5. APPLY PATCH
+          echo ">>> 5. APPLYING PATCH <<<"
+          cd build-system/fake-codesigning
+          
+          SOURCE_PROFILE=$(find . -name "*.mobileprovision" | head -n 1)
+          [ -z "$SOURCE_PROFILE" ] && touch dummy.mobileprovision && SOURCE_PROFILE="dummy.mobileprovision"
+          
+          REQUIRED=("Telegram.mobileprovision" "BroadcastUpload.mobileprovision" "Share.mobileprovision" "Widget.mobileprovision" "NotificationService.mobileprovision" "Intents.mobileprovision" "WatchApp.mobileprovision" "WatchExtension.mobileprovision")
+          DIRS=("." "profiles" "provisioning")
+          
+          for DIR in "${DIRS[@]}"; do
+             mkdir -p "$DIR"
+             for FILE in "${REQUIRED[@]}"; do
+               TARGET_PATH="$DIR/$FILE"
+               if [ ! -f "$TARGET_PATH" ]; then
+                 cp "$SOURCE_PROFILE" "$TARGET_PATH"
+               fi
+               
+               # A. Снимаем подпись
+               security cms -D -i "$TARGET_PATH" -o temp.plist || cp "$TARGET_PATH" temp.plist
+               
+               # B. Патчим Python-ом (Сертификат + ДАТА)
+               python3 ../../patcher.py temp.plist "$CERT_BASE64_CLEAN"
+               
+               # C. Подписываем
+               openssl smime -sign -in temp.plist -out "$TARGET_PATH" \
+                 -signer "$CERT_PATH" -inkey "$KEY_PATH" \
+                 -outform der -nodetach
+                 
+               rm -f temp.plist
+             done
+             
+             rm -f "$DIR/BUILD"
+             cat > "$DIR/BUILD" << EOF
+          package(default_visibility = ["//visibility:public"])
+          exports_files(glob(["*.mobileprovision"]))
+          EOF
+          done
+          cd ../..
+
+          # 6. KEYCHAIN
+          echo ">>> 6. KEYCHAIN SETUP <<<"
+          KEYCHAIN_PATH=$HOME/Library/Keychains/ios-build.keychain
+          KEYCHAIN_PASSWORD=ios-build
+          
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          
+          security import "$P12_PATH" -k "$KEYCHAIN_PATH" -P 12345 -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # 7. BUILD
+          echo ">>> 7. STARTING BUILD <<<"
+          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
+          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
+          APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
+          BUILD_NUMBER="$COMMIT_COUNT"
+          
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --overrideXcodeVersion \
+            build \
+            --configurationPath="build-system/appstore-configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER"
+
+          # 8. ARTIFACTS
+          echo ">>> 8. COLLECTING ARTIFACTS <<<"
+          OUTPUT_PATH="build/artifacts"
+          mkdir -p "$OUTPUT_PATH"
+          find bazel-out -name "Telegram.ipa" -exec cp {} $OUTPUT_PATH/SwiftGram.ipa \;
+
+      - name: Upload Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwiftGram-IPA
+          path: /Users/Shared/telegram-ios/build/artifacts/SwiftGram.ipa
+          retention-days: 7
